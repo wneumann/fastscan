@@ -1,7 +1,10 @@
 import NIO
 import Network
+import Foundation
 
 let host = "scanme.nmap.org"
+let port: UInt16 = 80
+
 print("System cores: \(System.coreCount)\n")
 let evGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
@@ -16,20 +19,22 @@ enum ScanError: Error {
 class Connection {
   let port: NWEndpoint.Port
   var connection: NWConnection?
-  var promise: EventLoopPromise<UInt16>
+  var promise: EventLoopPromise<Int>
+  var id: Int
   
-  init(port: UInt16, eLoop: EventLoop) {
+  init(port: UInt16, eLoop: EventLoop, id: Int) {
     self.port = NWEndpoint.Port(rawValue: port)!
-    self.promise = eLoop.makePromise(of: UInt16.self)
+    self.promise = eLoop.makePromise(of: Int.self)
+    self.id = id
   }
   
-  func setupNWConnection() -> EventLoopFuture<UInt16> {
+  func setupNWConnection() -> EventLoopFuture<Int> {
 //    print("Setting up nwConnection")
     
     let hostEndpoint = NWEndpoint.Host.init(host)
     connection = NWConnection(host: hostEndpoint, port: port, using: .tcp)
     connection!.stateUpdateHandler = self.stateDidChange(to:)
-  //    self.setupReceive(on: nwConnection)
+    self.setupReceive()
     print("Scanning \(host):\(port.rawValue)")
     connection!.start(queue: DispatchQueue.global())
     return promise.futureResult
@@ -38,9 +43,10 @@ class Connection {
   private func stateDidChange(to state: NWConnection.State) {
       switch state {
       case .ready:
-        print("Port \(port.rawValue) is way open")
-        connection?.cancel()
-        promise.succeed(port.rawValue)
+        print("connection #\(id) connected to \(connection!.endpoint) - sending message")
+        connection!.send(content: Data([0x04, 0, 0, 0x17, 0, 0, 0, 0, 0x12, 0, 0, 0, 0, 0, 0, 0]), completion: .idempotent)
+//        connection?.cancel()
+//        promise.succeed(port.rawValue)
       case .failed(let error):
         print("Port \(port.rawValue) is totes closed")
         let errorMessage = "Error: \(error.localizedDescription)"
@@ -55,55 +61,46 @@ class Connection {
         break
       }
   }
+  
+  private func setupReceive() {
+    self.connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { (data, _, isComplete, error) in
+      if let data = data, !data.isEmpty {
+          let message = String(data: data, encoding: .utf8)
+        print("connection #\(self.id) did receive, data: \(data.map { String(format: "%02x", $0) }) string: \(message ?? "-" )")
+        self.promise.succeed(self.id)
+      }
+      if isComplete {
+        print("connection \(self.id) completed")
+      } else if let error = error {
+        print("connection \(self.id) error: \(error)")
+        self.promise.fail(error)
+      } else {
+        self.connection!.cancel()
+      }
+    }
+  }
 
 }
 
 // Async code
 @available(OSX 10.14, *)
-func scan(port: UInt16) -> EventLoopFuture<UInt16> {
-  let conn = Connection(port: port, eLoop: evGroup.next())
+func scan(port: UInt16, id: Int) -> EventLoopFuture<Int> {
+  let conn = Connection(port: port, eLoop: evGroup.next(), id: id)
   return conn.setupNWConnection()
 }
 
-//func asyncPrint(on eLoop: EventLoop, delayInSecond: UInt32, string: String) -> EventLoopFuture<Int> {
-//    // Do the async work
-//    let promise = eLoop.submit {
-//      return sleepAndPrint(delayInSecond: delayInSecond, string: string)
-//    }
-//
-//    // Return the promise
-//    return promise
-//}
-//
-//func sleepAndPrint(delayInSecond: UInt32, string: String) -> Int {
-//    sleep(delayInSecond)
-//    print(string)
-//  return(2 * Int(delayInSecond))
-//}
-
-// ===========================
-// Main program
-
-//let future = asyncPrint(on: ev, delayInSecond: 3, string: "Hello, ")
-
 if #available(OSX 10.14, *) {
-  let futures: [EventLoopFuture<UInt16>] = (UInt16(20)...80).map {
+//  let futures: [EventLoopFuture<UInt16>] = (UInt16(20)...80).map {
 //  let futures: [EventLoopFuture<UInt16>] = [UInt16(20), 22, 25, 80].map {
-    scan(port: $0)
+  let futures: [EventLoopFuture<Int>] = (0..<32).map {
+    scan(port: port, id: $0)
   }
 
   print("Scanning...")
   let scanResult = try EventLoopFuture.whenAllComplete(futures, on: evGroup.next()).wait()
   let found = scanResult.filter { res in switch res { case .success: return true case .failure: return false} }.map { try! $0.get() }
   print("\n\n")
-  for port in found.sorted() { print("Port \(port) is open.") }
-//for res in zoop {
-//  switch res {
-//  case .success(let dub): print("dub: \(dub)")
-//  case .failure: print("dunno. borked.")
-//  }
-//}
-//let _ = try future.wait()
+  for id in found.sorted() { print("Send #\(id) worked.") }
 
 print("Scan done!")
 
